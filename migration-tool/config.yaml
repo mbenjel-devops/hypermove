@@ -1,0 +1,17 @@
+vcenter:
+  url: ""
+  username: ""
+  password: ""
+
+scvmm:
+  server: ""
+  username: ""
+  password: ""
+
+orchestrator:
+  max_retries: 3
+  retry_wait_seconds: 300
+  vm_timeout_seconds: 28800
+  scripts_path: "./scripts"
+  log_path: "./logs/migration.log"
+  db_path: "./migration.db"

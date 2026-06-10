@@ -1,0 +1,4 @@
+migration.db
+__pycache__/
+*.pyc
+logs/migration.log

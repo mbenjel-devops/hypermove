@@ -1,0 +1,3 @@
+VMName,SourceHost,TargetHost,OSVersion,Owner,MaintenanceWindow
+VM-PRD-001,vcenter01.local,hyperv01.local,2019,teamA,22:00-06:00
+VM-PRD-002,vcenter01.local,hyperv02.local,2008R2,teamB,22:00-06:00
