@@ -73,6 +73,15 @@ Overrides config.hooks_root.
 .PARAMETER SkipHooks
 Disable the hook framework for this run.
 
+.PARAMETER Resume
+Skip phases already completed successfully for a VM (uses persisted per-VM state).
+
+.PARAMETER ValidateConfig
+Validate the effective configuration against the schema before running; abort on errors.
+
+.PARAMETER CheckTargetCapacity
+Pre-validate target Hyper-V host CPU/RAM/disk capacity before EXEC. A FAIL aborts EXEC.
+
 .EXAMPLE
 .\00-Orchestrator.ps1 -VMName "SRVWEB01" -Mode SINGLE -Phase FULL -AutoRollback
 
@@ -114,7 +123,16 @@ param(
 
     # Hook framework: directory holding <hook>.d folders. Overrides config.hooks_root.
     [string]$HooksRoot,
-    [switch]$SkipHooks
+    [switch]$SkipHooks,
+
+    # Resume: skip phases already completed successfully (per-VM persisted state).
+    [switch]$Resume,
+
+    # Validate the effective configuration against the schema before running.
+    [switch]$ValidateConfig,
+
+    # Pre-validate target Hyper-V host capacity (CPU/RAM/disk) before EXEC.
+    [switch]$CheckTargetCapacity
 )
 
 Set-StrictMode -Version 2.0
@@ -124,6 +142,8 @@ Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'MigrationCommon.p
 
 $script:HooksRoot = ''
 $script:ClientName = ''
+$script:AuditDir = ''
+$script:EventWebhook = ''
 
 function Write-MigLog {
     param(
@@ -279,6 +299,16 @@ function Invoke-VmPhaseHook {
     return [bool]$result.Blocked
 }
 
+function Send-PipelineEvent {
+    param(
+        [Parameter(Mandatory)][string]$EventType,
+        [hashtable]$Data = @{}
+    )
+    if ($DryRun) { return }
+    if ([string]::IsNullOrWhiteSpace($script:AuditDir) -and [string]::IsNullOrWhiteSpace($script:EventWebhook)) { return }
+    [void](Send-MigrationEvent -EventType $EventType -Data $Data -AuditDir $script:AuditDir -WebhookUrl $script:EventWebhook)
+}
+
 function Invoke-VmPipeline {
     param(
         [Parameter(Mandatory)][string]$CurrentVM,
@@ -311,35 +341,45 @@ function Invoke-VmPipeline {
     }
 
     if ($Phase -in @('PRE', 'FULL')) {
-        if (Invoke-VmPhaseHook -Point 'pre-PRE' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal) {
-            $vmSummary.notes += 'Blocked by pre-PRE hook.'
-            $vmSummary.overall_result = 'FAILED'
-            $vmSummary.final_exit_code = 1
-            $vmSummary.completed_at = (Get-Date).ToString('o')
-            return $vmSummary
+        $outputDirLocal = [string]$ConfigObj.output_dir
+        if ($Resume -and -not $DryRun -and (Test-PhaseCompleted -OutputDir $outputDirLocal -VMName $CurrentVM -Phase 'PRE')) {
+            Write-MigLog -Level INFO -Message "[RESUME] Skipping PRE for $CurrentVM (already completed)."
+            $vmSummary.phases.pre.status = 'SKIPPED'
+            $vmSummary.notes += 'PRE skipped via resume.'
         }
+        else {
+            if (Invoke-VmPhaseHook -Point 'pre-PRE' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal) {
+                $vmSummary.notes += 'Blocked by pre-PRE hook.'
+                $vmSummary.overall_result = 'FAILED'
+                $vmSummary.final_exit_code = 1
+                $vmSummary.completed_at = (Get-Date).ToString('o')
+                return $vmSummary
+            }
 
-        $preParams = @{
-            VMName = $CurrentVM
-            vCenterServer = [string]$ConfigObj.vcenter_host
-            vCenterUser = [string]$ConfigObj.vcenter_user
-            OutputDir = [string]$ConfigObj.output_dir
-            Force = $true
+            $preParams = @{
+                VMName = $CurrentVM
+                vCenterServer = [string]$ConfigObj.vcenter_host
+                vCenterUser = [string]$ConfigObj.vcenter_user
+                OutputDir = [string]$ConfigObj.output_dir
+                Force = $true
+            }
+
+            $preResult = Invoke-PhaseScript -PhaseDisplayName "PHASE-PRE:$CurrentVM" -ScriptPath $PreScript -Parameters $preParams
+            $vmSummary.phases.pre.duration_s = $preResult.DurationSeconds
+            $vmSummary.phases.pre.exit_code = $preResult.ExitCode
+            $vmSummary.phases.pre.status = if ($preResult.ExitCode -eq 0) { 'SUCCESS' } else { 'FAILED' }
+
+            if ($preResult.ExitCode -ne 0) {
+                if (-not $DryRun) { [void](Set-MigrationPhaseState -OutputDir $outputDirLocal -VMName $CurrentVM -Phase 'PRE' -Status 'FAILED' -ExitCode $preResult.ExitCode) }
+                $vmSummary.overall_result = 'FAILED'
+                $vmSummary.final_exit_code = $preResult.ExitCode
+                $vmSummary.completed_at = (Get-Date).ToString('o')
+                return $vmSummary
+            }
+
+            if (-not $DryRun) { [void](Set-MigrationPhaseState -OutputDir $outputDirLocal -VMName $CurrentVM -Phase 'PRE' -Status 'SUCCESS' -ExitCode 0) }
+            [void](Invoke-VmPhaseHook -Point 'post-PRE' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal)
         }
-
-        $preResult = Invoke-PhaseScript -PhaseDisplayName "PHASE-PRE:$CurrentVM" -ScriptPath $PreScript -Parameters $preParams
-        $vmSummary.phases.pre.duration_s = $preResult.DurationSeconds
-        $vmSummary.phases.pre.exit_code = $preResult.ExitCode
-        $vmSummary.phases.pre.status = if ($preResult.ExitCode -eq 0) { 'SUCCESS' } else { 'FAILED' }
-
-        if ($preResult.ExitCode -ne 0) {
-            $vmSummary.overall_result = 'FAILED'
-            $vmSummary.final_exit_code = $preResult.ExitCode
-            $vmSummary.completed_at = (Get-Date).ToString('o')
-            return $vmSummary
-        }
-
-        [void](Invoke-VmPhaseHook -Point 'post-PRE' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal)
 
         if ($Phase -eq 'PRE') {
             $vmSummary.overall_result = 'SUCCESS'
@@ -350,75 +390,101 @@ function Invoke-VmPipeline {
     }
 
     if ($Phase -in @('EXEC', 'FULL')) {
-        if (Invoke-VmPhaseHook -Point 'pre-EXEC' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal) {
-            $vmSummary.notes += 'Blocked by pre-EXEC hook.'
-            $vmSummary.overall_result = 'FAILED'
-            $vmSummary.final_exit_code = 1
-            $vmSummary.completed_at = (Get-Date).ToString('o')
-            return $vmSummary
+        $outputDirLocal = [string]$ConfigObj.output_dir
+        if ($Resume -and -not $DryRun -and (Test-PhaseCompleted -OutputDir $outputDirLocal -VMName $CurrentVM -Phase 'EXEC')) {
+            Write-MigLog -Level INFO -Message "[RESUME] Skipping EXEC for $CurrentVM (already completed)."
+            $vmSummary.phases.exec.status = 'SKIPPED'
+            $vmSummary.notes += 'EXEC skipped via resume.'
         }
-
-        $maxRetry = if ($MaxExecRetries -lt 1) { 1 } else { $MaxExecRetries }
-        $attempt = 0
-        $execExit = 1
-        $execDuration = 0.0
-
-        do {
-            $attempt++
-            $execParams = @{
-                VMName = $CurrentVM
-                ManifestPath = $manifestPathLocal
-                HyperVHost = [string]$ConfigObj.hyperv_host
-                VMStoragePath = [string]$ConfigObj.hyperv_vm_path
-                VHDXPath = [string]$ConfigObj.hyperv_vhdx_path
-                SwitchName = [string]$ConfigObj.hyperv_switch
-                ConversionTool = if ($ConversionTool) { $ConversionTool } else { [string]$ConfigObj.conversion_tool }
-                StartVMAfterMigration = $StartVMAfterMigration
+        else {
+            if (Invoke-VmPhaseHook -Point 'pre-EXEC' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal) {
+                $vmSummary.notes += 'Blocked by pre-EXEC hook.'
+                $vmSummary.overall_result = 'FAILED'
+                $vmSummary.final_exit_code = 1
+                $vmSummary.completed_at = (Get-Date).ToString('o')
+                return $vmSummary
             }
 
-            $execResult = Invoke-PhaseScript -PhaseDisplayName "PHASE-EXEC:$CurrentVM" -ScriptPath $ExecScript -Parameters $execParams
-            $execExit = $execResult.ExitCode
-            $execDuration += $execResult.DurationSeconds
-
-            if ($execExit -ne 0 -and $attempt -lt $maxRetry) {
-                Write-MigLog -Level WARN -Message "EXEC failed for $CurrentVM (attempt $attempt/$maxRetry). Retry in $RetryWaitSeconds second(s)."
-                Invoke-SafeSleep -Seconds $RetryWaitSeconds
+            if ($CheckTargetCapacity -and -not $DryRun) {
+                $capacity = Test-TargetHostCapacity -ManifestPath $manifestPathLocal -HyperVHost ([string]$ConfigObj.hyperv_host) -VHDXPath ([string]$ConfigObj.hyperv_vhdx_path)
+                foreach ($f in $capacity.Findings) { Write-MigLog -Level INFO -Message "[CAPACITY] $f" }
+                if ($capacity.Status -eq 'FAIL') {
+                    Write-MigLog -Level FATAL -Message "Target host capacity check failed for $CurrentVM. Aborting EXEC."
+                    [void](Set-MigrationPhaseState -OutputDir $outputDirLocal -VMName $CurrentVM -Phase 'EXEC' -Status 'FAILED' -ExitCode 3)
+                    $vmSummary.phases.exec.status = 'FAILED'
+                    $vmSummary.phases.exec.exit_code = 3
+                    $vmSummary.notes += 'Blocked by target capacity check.'
+                    $vmSummary.overall_result = 'FAILED'
+                    $vmSummary.final_exit_code = 3
+                    $vmSummary.completed_at = (Get-Date).ToString('o')
+                    return $vmSummary
+                }
             }
-        }
-        while ($execExit -ne 0 -and $attempt -lt $maxRetry)
 
-        $vmSummary.phases.exec.duration_s = [Math]::Round($execDuration, 2)
-        $vmSummary.phases.exec.exit_code = $execExit
-        $vmSummary.phases.exec.retries = [Math]::Max($attempt - 1, 0)
-        $vmSummary.phases.exec.status = if ($execExit -eq 0) { 'SUCCESS' } else { 'FAILED' }
+            $maxRetry = if ($MaxExecRetries -lt 1) { 1 } else { $MaxExecRetries }
+            $attempt = 0
+            $execExit = 1
+            $execDuration = 0.0
 
-        if ($execExit -ne 0) {
-            if ($AutoRollback -and $Phase -eq 'FULL') {
-                $env:ROLLBACK_TRIGGER = 'auto-exec-fail'
-                $rbParams = @{
+            do {
+                $attempt++
+                $execParams = @{
                     VMName = $CurrentVM
                     ManifestPath = $manifestPathLocal
                     HyperVHost = [string]$ConfigObj.hyperv_host
-                    Force = $true
-                    RestoreSourceVM = $RestoreSourceOnFail
+                    VMStoragePath = [string]$ConfigObj.hyperv_vm_path
+                    VHDXPath = [string]$ConfigObj.hyperv_vhdx_path
+                    SwitchName = [string]$ConfigObj.hyperv_switch
+                    ConversionTool = if ($ConversionTool) { $ConversionTool } else { [string]$ConfigObj.conversion_tool }
+                    StartVMAfterMigration = $StartVMAfterMigration
                 }
-                $rbResult = Invoke-PhaseScript -PhaseDisplayName "PHASE-ROLLBACK:$CurrentVM" -ScriptPath $RollbackScript -Parameters $rbParams
-                $vmSummary.phases.rollback.duration_s = $rbResult.DurationSeconds
-                $vmSummary.phases.rollback.exit_code = $rbResult.ExitCode
-                $vmSummary.phases.rollback.status = if ($rbResult.ExitCode -eq 0) { 'SUCCESS' } else { 'FAILED' }
-                $vmSummary.overall_result = 'ROLLED_BACK'
-                $vmSummary.final_exit_code = 2
+
+                $execResult = Invoke-PhaseScript -PhaseDisplayName "PHASE-EXEC:$CurrentVM" -ScriptPath $ExecScript -Parameters $execParams
+                $execExit = $execResult.ExitCode
+                $execDuration += $execResult.DurationSeconds
+
+                if ($execExit -ne 0 -and $attempt -lt $maxRetry) {
+                    Write-MigLog -Level WARN -Message "EXEC failed for $CurrentVM (attempt $attempt/$maxRetry). Retry in $RetryWaitSeconds second(s)."
+                    Invoke-SafeSleep -Seconds $RetryWaitSeconds
+                }
             }
-            else {
-                $vmSummary.overall_result = 'FAILED'
-                $vmSummary.final_exit_code = $execExit
+            while ($execExit -ne 0 -and $attempt -lt $maxRetry)
+
+            $vmSummary.phases.exec.duration_s = [Math]::Round($execDuration, 2)
+            $vmSummary.phases.exec.exit_code = $execExit
+            $vmSummary.phases.exec.retries = [Math]::Max($attempt - 1, 0)
+            $vmSummary.phases.exec.status = if ($execExit -eq 0) { 'SUCCESS' } else { 'FAILED' }
+
+            if ($execExit -ne 0) {
+                if (-not $DryRun) { [void](Set-MigrationPhaseState -OutputDir $outputDirLocal -VMName $CurrentVM -Phase 'EXEC' -Status 'FAILED' -ExitCode $execExit) }
+                if ($AutoRollback -and $Phase -eq 'FULL') {
+                    $env:ROLLBACK_TRIGGER = 'auto-exec-fail'
+                    $rbParams = @{
+                        VMName = $CurrentVM
+                        ManifestPath = $manifestPathLocal
+                        HyperVHost = [string]$ConfigObj.hyperv_host
+                        Force = $true
+                        RestoreSourceVM = $RestoreSourceOnFail
+                    }
+                    $rbResult = Invoke-PhaseScript -PhaseDisplayName "PHASE-ROLLBACK:$CurrentVM" -ScriptPath $RollbackScript -Parameters $rbParams
+                    $vmSummary.phases.rollback.duration_s = $rbResult.DurationSeconds
+                    $vmSummary.phases.rollback.exit_code = $rbResult.ExitCode
+                    $vmSummary.phases.rollback.status = if ($rbResult.ExitCode -eq 0) { 'SUCCESS' } else { 'FAILED' }
+                    $vmSummary.overall_result = 'ROLLED_BACK'
+                    $vmSummary.final_exit_code = 2
+                }
+                else {
+                    $vmSummary.overall_result = 'FAILED'
+                    $vmSummary.final_exit_code = $execExit
+                }
+
+                $vmSummary.completed_at = (Get-Date).ToString('o')
+                return $vmSummary
             }
 
-            $vmSummary.completed_at = (Get-Date).ToString('o')
-            return $vmSummary
+            if (-not $DryRun) { [void](Set-MigrationPhaseState -OutputDir $outputDirLocal -VMName $CurrentVM -Phase 'EXEC' -Status 'SUCCESS' -ExitCode 0) }
+            [void](Invoke-VmPhaseHook -Point 'post-EXEC' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal)
         }
-
-        [void](Invoke-VmPhaseHook -Point 'post-EXEC' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal)
 
         if ($Phase -eq 'EXEC') {
             $vmSummary.overall_result = 'SUCCESS'
@@ -451,6 +517,7 @@ function Invoke-VmPipeline {
         $vmSummary.phases.post.status = if ($postResult.ExitCode -eq 0) { 'SUCCESS' } else { 'FAILED' }
 
         if ($postResult.ExitCode -eq 0) {
+            if (-not $DryRun) { [void](Set-MigrationPhaseState -OutputDir ([string]$ConfigObj.output_dir) -VMName $CurrentVM -Phase 'POST' -Status 'SUCCESS' -ExitCode 0) }
             [void](Invoke-VmPhaseHook -Point 'post-POST' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal)
             $vmSummary.overall_result = 'SUCCESS'
             $vmSummary.final_exit_code = 0
@@ -568,6 +635,26 @@ try {
         $transcriptStarted = $true
     }
 
+    if ($ValidateConfig) {
+        $cfgForValidation = if ($config -is [System.Collections.IDictionary]) { $config } else { ConvertTo-MigHashtableDeep -InputObject $config }
+        $validation = Test-MigrationConfig -Config $cfgForValidation
+        if (-not $validation.IsValid) {
+            Write-MigLog -Level FATAL -Message 'Configuration validation failed:'
+            foreach ($err in $validation.Errors) { Write-MigLog -Level ERROR -Message "  - $err" }
+            exit 1
+        }
+        Write-MigLog -Level INFO -Message 'Configuration validated against schema.'
+    }
+
+    # Event sink setup (generic audit log + optional webhook).
+    $reportDirForAudit = [string]$config.report_dir
+    if (-not [string]::IsNullOrWhiteSpace($reportDirForAudit)) {
+        $script:AuditDir = Join-Path -Path $reportDirForAudit -ChildPath 'audit'
+    }
+    if (($config -is [System.Collections.IDictionary]) -and $config.Contains('event_webhook')) {
+        $script:EventWebhook = [string]$config.event_webhook
+    }
+
     if (-not $SkipPrereqChecks) {
         $requiredModules = @('VMware.PowerCLI', 'Hyper-V')
         foreach ($m in $requiredModules) {
@@ -667,6 +754,8 @@ try {
 
     $vmResults = New-Object System.Collections.Generic.List[object]
 
+    Send-PipelineEvent -EventType 'pipeline.start' -Data @{ pipeline_id = $pipelineId; mode = $Mode; phase = $Phase; client = $script:ClientName; vm_total = $summary.vm_total }
+
     foreach ($current in $targetVms) {
         Write-MigLog -Level INFO -Message "Starting VM pipeline: $current"
 
@@ -679,6 +768,8 @@ try {
             'ROLLED_BACK' { $summary.vm_rolled_back++; $summary.vm_failed++ }
             default { $summary.vm_failed++ }
         }
+
+        Send-PipelineEvent -EventType ('vm.' + ([string]$oneResult.overall_result).ToLower()) -Data @{ vm = $current; result = [string]$oneResult.overall_result; final_exit_code = [int]$oneResult.final_exit_code; client = $script:ClientName }
 
         if ([string]$oneResult.overall_result -in @('FAILED', 'ROLLED_BACK')) {
             if (-not $SkipHooks -and -not [string]::IsNullOrWhiteSpace($script:HooksRoot)) {
@@ -694,6 +785,8 @@ try {
     }
 
     $summary.vms = @($vmResults)
+
+    Send-PipelineEvent -EventType 'pipeline.end' -Data @{ pipeline_id = $pipelineId; vm_total = $summary.vm_total; vm_done = $summary.vm_done; vm_failed = $summary.vm_failed; vm_partial = $summary.vm_partial }
 
     # post-pipeline hook (non-blocking).
     if (-not $SkipHooks -and -not [string]::IsNullOrWhiteSpace($script:HooksRoot)) {

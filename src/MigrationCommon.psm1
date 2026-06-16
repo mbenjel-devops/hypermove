@@ -392,6 +392,455 @@ function Invoke-MigrationHook {
     return $outcome
 }
 
+#region Schema validation
+
+function Test-MigrationSchema {
+    <#
+    .SYNOPSIS
+    Validates a hashtable against a lightweight schema descriptor.
+
+    .DESCRIPTION
+    The schema is a hashtable of field -> rule. Each rule supports:
+      Required (bool), Type ('string'|'int'|'number'|'bool'|'array'|'object'),
+      AllowEmpty (bool, strings/arrays), Values (allowed set), Min/Max (numbers).
+    Returns an object with IsValid (bool) and Errors (string[]).
+
+    .PARAMETER InputObject
+    The hashtable to validate.
+
+    .PARAMETER Schema
+    The schema descriptor hashtable.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$InputObject,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Schema
+    )
+
+    $errors = New-Object System.Collections.Generic.List[string]
+
+    foreach ($field in $Schema.Keys) {
+        $rule = $Schema[$field]
+        $present = $InputObject.Contains($field)
+        $value = if ($present) { $InputObject[$field] } else { $null }
+
+        $required = [bool]($rule['Required'])
+        if (-not $present) {
+            if ($required) { $errors.Add("Missing required field: $field") | Out-Null }
+            continue
+        }
+
+        $allowEmpty = $rule.Contains('AllowEmpty') -and [bool]$rule['AllowEmpty']
+        if (-not $allowEmpty) {
+            if ($value -is [string] -and [string]::IsNullOrWhiteSpace($value)) {
+                $errors.Add("Field '$field' must not be empty.") | Out-Null
+                continue
+            }
+            if (($value -is [System.Collections.IEnumerable]) -and ($value -isnot [string]) -and (@($value).Count -eq 0)) {
+                $errors.Add("Field '$field' must not be an empty array.") | Out-Null
+                continue
+            }
+        }
+
+        $type = [string]$rule['Type']
+        if (-not [string]::IsNullOrWhiteSpace($type)) {
+            $typeOk = switch ($type) {
+                'string' { $value -is [string] }
+                'int' { ($value -is [int]) -or ($value -is [long]) -or ($value -is [double] -and [Math]::Floor($value) -eq $value) }
+                'number' { ($value -is [int]) -or ($value -is [long]) -or ($value -is [double]) -or ($value -is [decimal]) }
+                'bool' { $value -is [bool] }
+                'array' { ($value -is [System.Collections.IEnumerable]) -and ($value -isnot [string]) }
+                'object' { $value -is [System.Collections.IDictionary] }
+                default { $true }
+            }
+            if (-not $typeOk) {
+                $errors.Add("Field '$field' should be of type '$type'.") | Out-Null
+                continue
+            }
+        }
+
+        if ($rule.Contains('Values')) {
+            $allowed = @($rule['Values'])
+            if ($allowed -notcontains $value) {
+                $errors.Add("Field '$field' has invalid value '$value'. Allowed: $($allowed -join ', ').") | Out-Null
+            }
+        }
+
+        if ($rule.Contains('Min') -and ($value -is [int] -or $value -is [double] -or $value -is [long])) {
+            if ($value -lt $rule['Min']) { $errors.Add("Field '$field' is below minimum $($rule['Min']).") | Out-Null }
+        }
+        if ($rule.Contains('Max') -and ($value -is [int] -or $value -is [double] -or $value -is [long])) {
+            if ($value -gt $rule['Max']) { $errors.Add("Field '$field' is above maximum $($rule['Max']).") | Out-Null }
+        }
+    }
+
+    return [pscustomobject]@{
+        IsValid = ($errors.Count -eq 0)
+        Errors = @($errors)
+    }
+}
+
+function Get-MigrationConfigSchema {
+    <#
+    .SYNOPSIS
+    Returns the schema descriptor for a migration configuration.
+    #>
+    [CmdletBinding()]
+    param()
+
+    return [ordered]@{
+        vcenter_host = @{ Required = $true; Type = 'string' }
+        hyperv_host = @{ Required = $true; Type = 'string' }
+        hyperv_vm_path = @{ Required = $true; Type = 'string' }
+        hyperv_vhdx_path = @{ Required = $true; Type = 'string' }
+        hyperv_switch = @{ Required = $true; Type = 'string' }
+        output_dir = @{ Required = $true; Type = 'string' }
+        report_dir = @{ Required = $true; Type = 'string' }
+        log_dir = @{ Required = $true; Type = 'string' }
+        conversion_tool = @{ Required = $true; Type = 'string'; Values = @('StarWindV2V', 'MVMC', 'QemuImg') }
+        critical_services = @{ Required = $false; Type = 'array' }
+    }
+}
+
+function Test-MigrationConfig {
+    <#
+    .SYNOPSIS
+    Validates an effective migration config hashtable against the config schema.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Config)
+
+    return Test-MigrationSchema -InputObject $Config -Schema (Get-MigrationConfigSchema)
+}
+
+#endregion
+
+#region Idempotence / resume state
+
+function Get-MigrationStatePath {
+    <#
+    .SYNOPSIS
+    Returns the path of the per-VM state file under <OutputDir>\state.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$OutputDir,
+        [Parameter(Mandatory)][string]$VMName
+    )
+
+    $stateDir = Join-Path -Path $OutputDir -ChildPath 'state'
+    if (-not (Test-Path -Path $stateDir)) {
+        New-Item -Path $stateDir -ItemType Directory -Force | Out-Null
+    }
+    $safeName = ($VMName -replace '[^A-Za-z0-9._-]', '_')
+    return Join-Path -Path $stateDir -ChildPath ("$safeName.state.json")
+}
+
+function Get-MigrationState {
+    <#
+    .SYNOPSIS
+    Loads (or initializes) the persisted migration state for a VM.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$OutputDir,
+        [Parameter(Mandatory)][string]$VMName
+    )
+
+    $path = Get-MigrationStatePath -OutputDir $OutputDir -VMName $VMName
+    if (Test-Path -Path $path) {
+        try {
+            $raw = Get-Content -Path $path -Raw | ConvertFrom-Json
+            return ConvertTo-MigHashtableDeep -InputObject $raw
+        }
+        catch {
+            Write-MigCommonLog -Level WARN -Message "State file unreadable for '$VMName', reinitializing: $($_.Exception.Message)" -Phase 'STATE'
+        }
+    }
+
+    return [ordered]@{
+        vm_name = $VMName
+        created_at = (Get-Date).ToString('o')
+        updated_at = (Get-Date).ToString('o')
+        phases = [ordered]@{}
+    }
+}
+
+function Set-MigrationPhaseState {
+    <#
+    .SYNOPSIS
+    Records the result of a phase in the persisted state and saves it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$OutputDir,
+        [Parameter(Mandatory)][string]$VMName,
+        [Parameter(Mandatory)][ValidateSet('PRE', 'EXEC', 'POST', 'ROLLBACK')][string]$Phase,
+        [Parameter(Mandatory)][ValidateSet('SUCCESS', 'FAILED', 'PARTIAL')][string]$Status,
+        [int]$ExitCode = 0
+    )
+
+    $state = Get-MigrationState -OutputDir $OutputDir -VMName $VMName
+    if (-not ($state['phases'] -is [System.Collections.IDictionary])) {
+        $state['phases'] = [ordered]@{}
+    }
+    $state['phases'][$Phase] = [ordered]@{
+        status = $Status
+        exit_code = $ExitCode
+        at = (Get-Date).ToString('o')
+    }
+    $state['updated_at'] = (Get-Date).ToString('o')
+
+    $path = Get-MigrationStatePath -OutputDir $OutputDir -VMName $VMName
+    try {
+        $state | ConvertTo-Json -Depth 8 | Set-Content -Path $path -Encoding UTF8
+    }
+    catch {
+        Write-MigCommonLog -Level WARN -Message "Could not persist state for '$VMName': $($_.Exception.Message)" -Phase 'STATE'
+    }
+    return $state
+}
+
+function Test-PhaseCompleted {
+    <#
+    .SYNOPSIS
+    Returns $true if the given phase was previously completed successfully.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$OutputDir,
+        [Parameter(Mandatory)][string]$VMName,
+        [Parameter(Mandatory)][ValidateSet('PRE', 'EXEC', 'POST', 'ROLLBACK')][string]$Phase
+    )
+
+    $state = Get-MigrationState -OutputDir $OutputDir -VMName $VMName
+    if ($state['phases'] -is [System.Collections.IDictionary] -and $state['phases'].Contains($Phase)) {
+        return ([string]$state['phases'][$Phase]['status'] -eq 'SUCCESS')
+    }
+    return $false
+}
+
+function Reset-MigrationState {
+    <#
+    .SYNOPSIS
+    Deletes the persisted state file for a VM (fresh start).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$OutputDir,
+        [Parameter(Mandatory)][string]$VMName
+    )
+
+    $path = Get-MigrationStatePath -OutputDir $OutputDir -VMName $VMName
+    if (Test-Path -Path $path) {
+        Remove-Item -Path $path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+#endregion
+
+#region Target host capacity
+
+function Test-TargetHostCapacity {
+    <#
+    .SYNOPSIS
+    Checks whether a target Hyper-V host can accommodate the required resources.
+
+    .DESCRIPTION
+    Reads required vCPU / RAM / disk from a manifest and compares against the target host
+    capacity queried via Hyper-V / storage cmdlets. Degrades gracefully when the cmdlets
+    or host are not reachable (returns WARN-level findings, never throws).
+
+    .PARAMETER ManifestPath
+    Path to the PRE manifest JSON.
+
+    .PARAMETER HyperVHost
+    Target Hyper-V host name.
+
+    .PARAMETER VHDXPath
+    Target path where VHDX files will be created (used to find the destination volume).
+
+    .OUTPUTS
+    [pscustomobject] with Status ('PASS'|'WARN'|'FAIL') and Findings (string[]).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ManifestPath,
+        [Parameter(Mandatory)][string]$HyperVHost,
+        [string]$VHDXPath
+    )
+
+    $findings = New-Object System.Collections.Generic.List[string]
+    $status = 'PASS'
+
+    if (-not (Test-Path -Path $ManifestPath)) {
+        return [pscustomobject]@{ Status = 'FAIL'; Findings = @("Manifest not found: $ManifestPath") }
+    }
+
+    try {
+        $manifest = Get-Content -Path $ManifestPath -Raw | ConvertFrom-Json
+    }
+    catch {
+        return [pscustomobject]@{ Status = 'FAIL'; Findings = @("Manifest unreadable: $($_.Exception.Message)") }
+    }
+
+    $reqVcpu = 0
+    $reqRamMB = 0
+    try { $reqVcpu = [int]$manifest.compute.vcpu } catch { }
+    try { $reqRamMB = [int]$manifest.compute.ram_mb } catch { }
+
+    $reqDiskGB = 0.0
+    try {
+        foreach ($d in @($manifest.disks)) {
+            if ($d -and $d.size_gb) { $reqDiskGB += [double]$d.size_gb }
+        }
+    }
+    catch { }
+
+    # CPU / RAM via Hyper-V host.
+    if (Get-Command -Name Get-VMHost -ErrorAction SilentlyContinue) {
+        try {
+            $vmHost = Get-VMHost -ComputerName $HyperVHost -ErrorAction Stop
+            $hostLps = [int]$vmHost.LogicalProcessorCount
+            if ($hostLps -gt 0 -and $reqVcpu -gt $hostLps) {
+                $findings.Add("Requested vCPU ($reqVcpu) exceeds host logical processors ($hostLps).") | Out-Null
+                $status = 'WARN'
+            }
+
+            if (Get-Command -Name Get-CimInstance -ErrorAction SilentlyContinue) {
+                try {
+                    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ComputerName $HyperVHost -ErrorAction Stop
+                    $freeRamMB = [int]([double]$os.FreePhysicalMemory / 1024)
+                    if ($reqRamMB -gt 0 -and $freeRamMB -gt 0 -and $reqRamMB -gt $freeRamMB) {
+                        $findings.Add("Requested RAM ($reqRamMB MB) exceeds host free memory ($freeRamMB MB).") | Out-Null
+                        $status = 'WARN'
+                    }
+                }
+                catch {
+                    $findings.Add("Could not read host memory: $($_.Exception.Message)") | Out-Null
+                    if ($status -eq 'PASS') { $status = 'WARN' }
+                }
+            }
+        }
+        catch {
+            $findings.Add("Could not query Hyper-V host '$HyperVHost': $($_.Exception.Message)") | Out-Null
+            if ($status -eq 'PASS') { $status = 'WARN' }
+        }
+    }
+    else {
+        $findings.Add('Hyper-V cmdlets not available on this machine; CPU/RAM capacity not verified.') | Out-Null
+        if ($status -eq 'PASS') { $status = 'WARN' }
+    }
+
+    # Disk capacity on destination volume.
+    if (-not [string]::IsNullOrWhiteSpace($VHDXPath)) {
+        $driveLetter = $null
+        if ($VHDXPath -match '^([A-Za-z]):') { $driveLetter = $Matches[1] }
+
+        if ($driveLetter -and (Get-Command -Name Get-Volume -ErrorAction SilentlyContinue)) {
+            try {
+                $vol = Get-Volume -DriveLetter $driveLetter -ErrorAction Stop
+                $freeGB = [double]$vol.SizeRemaining / 1GB
+                # Require destination free space >= required disk + 10% headroom.
+                $needed = $reqDiskGB * 1.10
+                if ($reqDiskGB -gt 0 -and $freeGB -lt $needed) {
+                    $findings.Add(("Destination volume {0}: free {1:N0} GB < required {2:N0} GB (+10% headroom)." -f $driveLetter, $freeGB, $needed)) | Out-Null
+                    $status = 'FAIL'
+                }
+            }
+            catch {
+                $findings.Add("Could not read destination volume '$driveLetter': $($_.Exception.Message)") | Out-Null
+                if ($status -eq 'PASS') { $status = 'WARN' }
+            }
+        }
+        else {
+            $findings.Add('Volume cmdlets not available or path not drive-rooted; disk capacity not verified.') | Out-Null
+            if ($status -eq 'PASS') { $status = 'WARN' }
+        }
+    }
+
+    if ($findings.Count -eq 0) {
+        $findings.Add("Capacity OK: vCPU=$reqVcpu, RAM=$reqRamMB MB, disk=$([Math]::Round($reqDiskGB,1)) GB.") | Out-Null
+    }
+
+    return [pscustomobject]@{
+        Status = $status
+        Findings = @($findings)
+        RequiredVcpu = $reqVcpu
+        RequiredRamMB = $reqRamMB
+        RequiredDiskGB = [Math]::Round($reqDiskGB, 1)
+    }
+}
+
+#endregion
+
+#region Event dispatch (generic integration)
+
+function Send-MigrationEvent {
+    <#
+    .SYNOPSIS
+    Emits a structured migration event to a generic, vendor-neutral sink.
+
+    .DESCRIPTION
+    Always appends the event to an audit JSON-Lines file. Optionally POSTs the event as
+    JSON to a webhook URL when one is configured. Never throws on delivery failure.
+
+    .PARAMETER EventType
+    Dot-namespaced event type, e.g. 'pipeline.start', 'vm.success', 'vm.failed'.
+
+    .PARAMETER Data
+    Hashtable payload describing the event.
+
+    .PARAMETER AuditDir
+    Directory for the audit log file (events-YYYYMMDD.jsonl).
+
+    .PARAMETER WebhookUrl
+    Optional generic webhook URL to POST the event to.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$EventType,
+        [hashtable]$Data = @{},
+        [string]$AuditDir,
+        [string]$WebhookUrl
+    )
+
+    $event = [ordered]@{
+        event = $EventType
+        timestamp = (Get-Date).ToString('o')
+        machine = $env:COMPUTERNAME
+        data = $Data
+    }
+    $json = $event | ConvertTo-Json -Depth 10 -Compress
+
+    if (-not [string]::IsNullOrWhiteSpace($AuditDir)) {
+        try {
+            if (-not (Test-Path -Path $AuditDir)) {
+                New-Item -Path $AuditDir -ItemType Directory -Force | Out-Null
+            }
+            $auditFile = Join-Path -Path $AuditDir -ChildPath ("events-{0}.jsonl" -f (Get-Date -Format 'yyyyMMdd'))
+            Add-Content -Path $auditFile -Value $json -Encoding UTF8
+        }
+        catch {
+            Write-MigCommonLog -Level WARN -Message "Could not write audit event: $($_.Exception.Message)" -Phase 'EVENT'
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($WebhookUrl)) {
+        try {
+            Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $json -ContentType 'application/json' -TimeoutSec 15 -ErrorAction Stop | Out-Null
+            Write-MigCommonLog -Level INFO -Message "Event '$EventType' delivered to webhook." -Phase 'EVENT'
+        }
+        catch {
+            Write-MigCommonLog -Level WARN -Message "Webhook delivery failed for '$EventType': $($_.Exception.Message)" -Phase 'EVENT'
+        }
+    }
+
+    return [pscustomobject]@{ Event = $EventType; Json = $json }
+}
+
+#endregion
+
 Export-ModuleMember -Function @(
     'Write-MigCommonLog',
     'ConvertTo-MigHashtableDeep',
@@ -400,5 +849,15 @@ Export-ModuleMember -Function @(
     'Resolve-MigSecretsInTree',
     'Get-MigrationConfig',
     'New-MigHookContext',
-    'Invoke-MigrationHook'
+    'Invoke-MigrationHook',
+    'Test-MigrationSchema',
+    'Get-MigrationConfigSchema',
+    'Test-MigrationConfig',
+    'Get-MigrationStatePath',
+    'Get-MigrationState',
+    'Set-MigrationPhaseState',
+    'Test-PhaseCompleted',
+    'Reset-MigrationState',
+    'Test-TargetHostCapacity',
+    'Send-MigrationEvent'
 )

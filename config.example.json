@@ -9,6 +9,7 @@
   "report_dir": "C:\\Migration\\Reports",
   "log_dir": "C:\\Migration\\Logs",
   "conversion_tool": "StarWindV2V",
+  "event_webhook": "",
   "critical_services": [
     "W32Time",
     "Netlogon",

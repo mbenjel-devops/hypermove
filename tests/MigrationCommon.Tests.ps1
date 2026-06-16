@@ -179,4 +179,103 @@ Describe 'MigrationCommon module' {
             $r.Results[0].DryRun | Should -BeTrue
         }
     }
+
+    Context 'Test-MigrationSchema' {
+        It 'passes a valid object' {
+            $schema = [ordered]@{ a = @{ Required = $true; Type = 'string' } }
+            $r = Test-MigrationSchema -InputObject ([ordered]@{ a = 'x' }) -Schema $schema
+            $r.IsValid | Should -BeTrue
+        }
+
+        It 'flags missing required fields' {
+            $schema = [ordered]@{ a = @{ Required = $true; Type = 'string' } }
+            $r = Test-MigrationSchema -InputObject ([ordered]@{}) -Schema $schema
+            $r.IsValid | Should -BeFalse
+            $r.Errors | Should -Contain 'Missing required field: a'
+        }
+
+        It 'enforces allowed values' {
+            $schema = [ordered]@{ tool = @{ Required = $true; Type = 'string'; Values = @('A', 'B') } }
+            $r = Test-MigrationSchema -InputObject ([ordered]@{ tool = 'C' }) -Schema $schema
+            $r.IsValid | Should -BeFalse
+        }
+
+        It 'enforces numeric min/max' {
+            $schema = [ordered]@{ n = @{ Required = $true; Type = 'int'; Min = 1; Max = 10 } }
+            (Test-MigrationSchema -InputObject ([ordered]@{ n = 0 }) -Schema $schema).IsValid | Should -BeFalse
+            (Test-MigrationSchema -InputObject ([ordered]@{ n = 5 }) -Schema $schema).IsValid | Should -BeTrue
+        }
+    }
+
+    Context 'Test-MigrationConfig' {
+        It 'accepts a complete config' {
+            $cfg = [ordered]@{
+                vcenter_host = 'v'; hyperv_host = 'h'; hyperv_vm_path = 'p'; hyperv_vhdx_path = 'q'
+                hyperv_switch = 's'; output_dir = 'o'; report_dir = 'r'; log_dir = 'l'; conversion_tool = 'StarWindV2V'
+            }
+            (Test-MigrationConfig -Config $cfg).IsValid | Should -BeTrue
+        }
+
+        It 'rejects an unknown conversion tool' {
+            $cfg = [ordered]@{
+                vcenter_host = 'v'; hyperv_host = 'h'; hyperv_vm_path = 'p'; hyperv_vhdx_path = 'q'
+                hyperv_switch = 's'; output_dir = 'o'; report_dir = 'r'; log_dir = 'l'; conversion_tool = 'Bogus'
+            }
+            (Test-MigrationConfig -Config $cfg).IsValid | Should -BeFalse
+        }
+    }
+
+    Context 'Migration state store' {
+        It 'records and detects a completed phase' {
+            $out = Join-Path $TestDrive 'st1'
+            Set-MigrationPhaseState -OutputDir $out -VMName 'SRV1' -Phase 'PRE' -Status 'SUCCESS' | Out-Null
+            Test-PhaseCompleted -OutputDir $out -VMName 'SRV1' -Phase 'PRE' | Should -BeTrue
+            Test-PhaseCompleted -OutputDir $out -VMName 'SRV1' -Phase 'EXEC' | Should -BeFalse
+        }
+
+        It 'treats a failed phase as not completed' {
+            $out = Join-Path $TestDrive 'st2'
+            Set-MigrationPhaseState -OutputDir $out -VMName 'SRV2' -Phase 'EXEC' -Status 'FAILED' -ExitCode 4 | Out-Null
+            Test-PhaseCompleted -OutputDir $out -VMName 'SRV2' -Phase 'EXEC' | Should -BeFalse
+        }
+
+        It 'resets state' {
+            $out = Join-Path $TestDrive 'st3'
+            Set-MigrationPhaseState -OutputDir $out -VMName 'SRV3' -Phase 'PRE' -Status 'SUCCESS' | Out-Null
+            Reset-MigrationState -OutputDir $out -VMName 'SRV3'
+            Test-PhaseCompleted -OutputDir $out -VMName 'SRV3' -Phase 'PRE' | Should -BeFalse
+        }
+
+        It 'sanitizes VM names in the state file path' {
+            $out = Join-Path $TestDrive 'st4'
+            $path = Get-MigrationStatePath -OutputDir $out -VMName 'srv/with:bad*chars'
+            (Split-Path -Path $path -Leaf) | Should -Be 'srv_with_bad_chars.state.json'
+        }
+    }
+
+    Context 'Test-TargetHostCapacity' {
+        It 'returns FAIL when the manifest is missing' {
+            $r = Test-TargetHostCapacity -ManifestPath (Join-Path $TestDrive 'nope.json') -HyperVHost 'h'
+            $r.Status | Should -Be 'FAIL'
+        }
+
+        It 'computes required disk from manifest and degrades gracefully without Hyper-V' {
+            $man = Join-Path $TestDrive 'm.json'
+            @{ compute = @{ vcpu = 2; ram_mb = 4096 }; disks = @(@{ size_gb = 30 }, @{ size_gb = 20 }) } | ConvertTo-Json -Depth 5 | Set-Content $man
+            $r = Test-TargetHostCapacity -ManifestPath $man -HyperVHost 'unreachable-host'
+            $r.RequiredDiskGB | Should -Be 50
+            $r.Status | Should -BeIn @('PASS', 'WARN')
+        }
+    }
+
+    Context 'Send-MigrationEvent' {
+        It 'appends an event to the audit log' {
+            $audit = Join-Path $TestDrive 'audit'
+            Send-MigrationEvent -EventType 'unit.test' -Data @{ k = 'v' } -AuditDir $audit | Out-Null
+            $file = Get-ChildItem -Path $audit -Filter 'events-*.jsonl' | Select-Object -First 1
+            $file | Should -Not -BeNullOrEmpty
+            (Get-Content $file.FullName -Raw) | Should -Match 'unit.test'
+        }
+    }
 }
+

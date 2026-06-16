@@ -150,6 +150,48 @@ Values shaped `secret://<Vault>/<Name>` in a profile are resolved at load time v
 `Microsoft.PowerShell.SecretManagement`. Store credentials in a registered vault and
 reference them instead of hard-coding. Example: `"vcenter_pass": "secret://MigrationVault/clientA-vcenter"`.
 
+## Enterprise: operational robustness
+
+### Configuration validation
+
+Validate the effective config against a schema before any work runs. Catches missing
+or malformed fields and unknown `conversion_tool` values early:
+
+```powershell
+.\src\00-Orchestrator.ps1 -Client "example-client" -Mode SINGLE -VMName "SRV01" -Phase FULL -ValidateConfig
+```
+
+Errors abort the run before touching infrastructure.
+
+### Idempotent resume
+
+Each VM phase result is persisted under `<output_dir>/state/<vm>.state.json`. With
+`-Resume`, phases already completed successfully (`PRE`, `EXEC`, `POST`) are skipped,
+so a re-run after an interruption continues where it stopped instead of redoing work:
+
+```powershell
+.\src\00-Orchestrator.ps1 -Client "example-client" -Mode BATCH -VMListPath .\vms.csv -Phase FULL -Resume
+```
+
+### Target capacity pre-check
+
+`-CheckTargetCapacity` compares each VM's manifest requirements (vCPU, RAM, disk) to
+the Hyper-V host's available resources before conversion. Insufficient disk
+(including a 10% headroom) aborts that VM with exit code 3. Missing Hyper-V access
+degrades gracefully to a warning rather than failing.
+
+```powershell
+.\src\00-Orchestrator.ps1 -Client "example-client" -Mode SINGLE -VMName "SRV01" -Phase FULL -CheckTargetCapacity
+```
+
+### Audit events and webhooks
+
+Pipeline and per-VM events (`pipeline.start`, `vm.success`, `vm.failed`,
+`pipeline.end`, ...) are appended to a vendor-neutral audit log at
+`<report_dir>/audit/events-YYYYMMDD.jsonl`. Set `"event_webhook"` in the config to
+also POST each event as JSON to an external system (SIEM, ITSM, chat). Delivery
+failures never interrupt the migration.
+
 ## Tests
 
 Local run (requires Pester 5.5+):
