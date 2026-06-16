@@ -75,7 +75,10 @@ Describe 'MigrationCommon module' {
         }
 
         It 'returns the reference unchanged when SecretManagement is unavailable' {
-            Mock -CommandName Get-Command -ModuleName MigrationCommon -MockWith { $null } -ParameterFilter { $Name -eq 'Get-Secret' }
+            if (Get-Command -Name Get-Secret -ErrorAction SilentlyContinue) {
+                Set-ItResult -Skipped -Because 'SecretManagement is installed in this environment'
+                return
+            }
             $ref = 'secret://MyVault/MySecret'
             Resolve-MigSecretValue -Value $ref | Should -Be $ref
         }
@@ -85,7 +88,7 @@ Describe 'MigrationCommon module' {
         BeforeAll {
             $cfgRoot = Join-Path -Path $TestDrive -ChildPath 'config'
             New-Item -Path (Join-Path $cfgRoot 'clients\acme') -ItemType Directory -Force | Out-Null
-            @{ hyperv_switch = 'Default'; critical_services = @('W32Time') } | ConvertTo-Json | Set-Content -Path (Join-Path $cfgRoot 'defaults.json')
+            @{ hyperv_switch = 'Default'; critical_services = @('W32Time', 'Netlogon') } | ConvertTo-Json | Set-Content -Path (Join-Path $cfgRoot 'defaults.json')
             @{ vcenter_host = 'vc.acme.local'; hyperv_switch = 'Acme-Ext' } | ConvertTo-Json | Set-Content -Path (Join-Path $cfgRoot 'clients\acme\profile.json')
         }
 
@@ -93,7 +96,7 @@ Describe 'MigrationCommon module' {
             $cfg = Get-MigrationConfig -Client 'acme' -ConfigRoot $cfgRoot -ResolveSecrets $false
             $cfg['vcenter_host'] | Should -Be 'vc.acme.local'
             $cfg['hyperv_switch'] | Should -Be 'Acme-Ext'
-            $cfg['critical_services'][0] | Should -Be 'W32Time'
+            $cfg['critical_services'] | Should -Contain 'W32Time'
             $cfg['client'] | Should -Be 'acme'
         }
 

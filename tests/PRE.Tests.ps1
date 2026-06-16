@@ -3,12 +3,12 @@
 
 Set-StrictMode -Version 2.0
 
-$here = Split-Path -Parent $MyInvocation.MyCommand.Path
-$projectRoot = Split-Path -Parent $here
-$scriptUnderTest = Join-Path -Path $projectRoot -ChildPath 'src\01-PRE-Discovery.ps1'
-
 Describe '01-PRE-Discovery.ps1' {
     BeforeAll {
+        $here = Split-Path -Parent $PSCommandPath
+        $projectRoot = Split-Path -Parent $here
+        $scriptUnderTest = Join-Path -Path $projectRoot -ChildPath 'src\01-PRE-Discovery.ps1'
+
         if (-not (Test-Path -Path $scriptUnderTest)) {
             throw "Script under test not found: $scriptUnderTest"
         }

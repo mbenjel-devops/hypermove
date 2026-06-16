@@ -218,9 +218,9 @@ function Get-MigrationConfig {
         }
 
         $profileRaw = Get-Content -Path $profilePath -Raw | ConvertFrom-Json
-        $profile = ConvertTo-MigHashtableDeep -InputObject $profileRaw
+        $profileObj = ConvertTo-MigHashtableDeep -InputObject $profileRaw
 
-        $effective = Merge-MigHashtable -Base $base -Override $profile
+        $effective = Merge-MigHashtable -Base $base -Override $profileObj
         $effective['client'] = $Client
         $effective['config_root'] = $ConfigRoot
     }
