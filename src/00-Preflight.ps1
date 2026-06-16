@@ -324,7 +324,7 @@ try {
         config_file = $ConfigFile
         machine = $env:COMPUTERNAME
         powershell = $psVersion.ToString()
-        checks = @($script:checks)
+        checks = $script:checks.ToArray()
         summary = [ordered]@{ pass = $passCount; warn = $warnCount; fail = $failCount }
         overall_status = $overall
     }
