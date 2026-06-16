@@ -1,0 +1,7 @@
+manifests/*.json
+reports/
+logs/
+*.log
+.env
+**/secret*
+**/*password*
