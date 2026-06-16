@@ -46,7 +46,13 @@ param(
     [string]$vCenterUser = $env:VCENTER_USER,
     [SecureString]$vCenterPass,
     [string]$OutputDir = "C:\Migration\Manifests",
-    [switch]$Force
+    [switch]$Force,
+
+    # Opt-in: consolidate/remove existing snapshots before discovery (destructive on source).
+    [switch]$RemoveSnapshots,
+
+    # Opt-in: explicitly approve migration of a legacy guest OS (2000/2003/2008/2008 R2/NT).
+    [switch]$ApproveLegacyOS
 )
 
 Set-StrictMode -Version 2.0
@@ -214,6 +220,24 @@ function Test-ValidIPv4 {
     }
 
     return $addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork
+}
+
+function Test-LegacyOS {
+    param([string]$OsName)
+    if ([string]::IsNullOrWhiteSpace($OsName)) { return $false }
+    # Match legacy Windows guest OS families that frequently break first-run migrations.
+    $patterns = @(
+        'Windows\s*2000',
+        'Windows\s*Server\s*2003',
+        'Windows\s*XP',
+        'Windows\s*Server\s*2008(?!\s*R2)',
+        'Windows\s*Server\s*2008\s*R2',
+        'Windows\s*NT'
+    )
+    foreach ($p in $patterns) {
+        if ($OsName -match $p) { return $true }
+    }
+    return $false
 }
 
 try {
@@ -440,6 +464,28 @@ cat /etc/resolv.conf
     try {
         $snapshots = @(Get-Snapshot -VM $vm -ErrorAction SilentlyContinue)
         Write-MigLog -Level INFO -Message "Collected block E snapshots: $($snapshots.Count)."
+
+        if ($snapshots.Count -ge 1 -and $RemoveSnapshots) {
+            $snapNamesToRemove = ($snapshots | Select-Object -ExpandProperty Name) -join ', '
+            if ($PSCmdlet.ShouldProcess($VMName, "Remove $($snapshots.Count) snapshot(s): $snapNamesToRemove")) {
+                Write-MigLog -Level WARN -Message "RemoveSnapshots requested. Consolidating snapshots: $snapNamesToRemove"
+                foreach ($snap in $snapshots) {
+                    try {
+                        Remove-Snapshot -Snapshot $snap -RemoveChildren -Confirm:$false -ErrorAction Stop
+                        Write-MigLog -Level INFO -Message "Snapshot removed: $($snap.Name)"
+                    }
+                    catch {
+                        Write-MigLog -Level ERROR -Message "Failed to remove snapshot '$($snap.Name)': $($_.Exception.Message)"
+                    }
+                }
+                # Re-query after consolidation to reflect the new state.
+                $snapshots = @(Get-Snapshot -VM $vm -ErrorAction SilentlyContinue)
+                Write-MigLog -Level INFO -Message "Post-consolidation snapshot count: $($snapshots.Count)."
+            }
+            else {
+                Write-MigLog -Level WARN -Message 'Snapshot consolidation skipped (ShouldProcess declined).'
+            }
+        }
     }
     catch {
         Write-MigLog -Level ERROR -Message "Block E failed: $($_.Exception.Message)"
@@ -526,6 +572,22 @@ cat /etc/resolv.conf
     }
     else {
         Add-Check -Id 'CHECK_07' -Status 'PASS' -Detail 'All adapters are VMXNET3.'
+    }
+
+    # CHECK_08 — Legacy guest OS gating
+    if (Test-LegacyOS -OsName $guestFullName) {
+        if ($ApproveLegacyOS) {
+            Add-Check -Id 'CHECK_08' -Status 'WARN' -Detail "Legacy guest OS approved for migration: $guestFullName"
+            Write-MigLog -Level WARN -Message "Legacy OS '$guestFullName' explicitly approved (-ApproveLegacyOS). Proceed with caution."
+        }
+        else {
+            Add-Check -Id 'CHECK_08' -Status 'FAIL' -Detail "Legacy guest OS not approved: $guestFullName"
+            Write-Error "[FATAL][CHECK_08] Legacy OS detecte : $guestFullName. Utilisez -ApproveLegacyOS pour autoriser explicitement."
+            $blockingFailure = $true
+        }
+    }
+    else {
+        Add-Check -Id 'CHECK_08' -Status 'PASS' -Detail "Guest OS not flagged as legacy: $guestFullName"
     }
 
     if ($blockingFailure) {

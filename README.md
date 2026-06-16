@@ -4,7 +4,10 @@ Pipeline PowerShell de migration VMware vers Hyper-V, structuré en 4 phases + o
 
 ## Structure
 
+- Start-Migration.ps1 (interactive launcher / menu for technicians)
+- config.example.json (copy to your config path and edit)
 - src/00-Orchestrator.ps1
+- src/00-Preflight.ps1 (readiness / doctor check)
 - src/01-PRE-Discovery.ps1
 - src/02-EXEC-Migration.ps1
 - src/03-POST-Validation.ps1
@@ -23,18 +26,34 @@ Pipeline PowerShell de migration VMware vers Hyper-V, structuré en 4 phases + o
 
 ## Quick start
 
-1. Configure environment variables from .env.example.
-2. Create migration config file at C:\Migration\config.json.
-3. Run PRE phase first on a dev VM:
+Easiest path for technicians: use the interactive launcher.
+
+```powershell
+.\Start-Migration.ps1
+```
+
+The launcher guides you through pre-flight, discovery, full migration, batch, post-validation and rollback.
+
+Manual path:
+
+1. Copy config.example.json to your config path (default C:\Migration\config.json) and edit the values.
+2. Configure environment variables from .env.example.
+3. Run the pre-flight readiness check on the worker machine:
+
+```powershell
+.\src\00-Preflight.ps1 -ConfigFile "C:\Migration\config.json" -TestConnections
+```
+
+4. Run PRE phase first on a dev VM:
 
 ```powershell
 .\src\01-PRE-Discovery.ps1 -VMName "TEST-VM" -OutputDir "C:\Migration\Manifests" -Force
 ```
 
-4. Run full orchestrated migration (single VM mode):
+5. Run full orchestrated migration (single VM mode):
 
 ```powershell
-.\src\00-Orchestrator.ps1 -VMName "TEST-VM" -Mode SINGLE -Phase FULL -AutoRollback -StartVMAfterMigration
+.\src\00-Orchestrator.ps1 -VMName "TEST-VM" -Mode SINGLE -Phase FULL -RunPreflight -AutoRollback -StartVMAfterMigration
 ```
 
 ## Orchestrator modes
@@ -58,10 +77,23 @@ Pipeline PowerShell de migration VMware vers Hyper-V, structuré en 4 phases + o
 
 ### Retry and resilience options
 
+- -RunPreflight: run the readiness check before the pipeline; abort on blocking issues
 - -MaxExecRetries: retry EXEC phase for a VM before marking failure
 - -RetryWaitSeconds: wait between retries
 - -ContinueOnError: in batch modes, continue with next VM after a failure
 - -SkipPrereqChecks: skip module/env checks (useful in controlled CI)
+
+## Handling real-world issues
+
+Common field problems and how the toolkit handles them:
+
+- Forgotten snapshots: PRE blocks by default (CHECK_01). Add `-RemoveSnapshots` to PRE to
+  consolidate them first (opt-in, prompts via ShouldProcess).
+- Legacy guest OS (2000/2003/2008/2008 R2/NT): PRE blocks by default (CHECK_08). Add
+  `-ApproveLegacyOS` to proceed with an explicit, audited approval.
+- First-run environment gaps (missing modules, env vars, unwritable folders, missing
+  conversion tool): run `src\00-Preflight.ps1` (the doctor) to get a clear PASS/WARN/FAIL
+  report with remediation hints before migrating.
 
 ## Tests
 

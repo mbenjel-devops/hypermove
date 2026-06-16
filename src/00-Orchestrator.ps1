@@ -55,6 +55,10 @@ Wait in seconds between EXEC retries.
 .PARAMETER SkipPrereqChecks
 Skip module and environment prechecks.
 
+.PARAMETER RunPreflight
+Run the pre-flight readiness check (src\00-Preflight.ps1) before the pipeline.
+Aborts the run if pre-flight reports a blocking issue (exit code 2).
+
 .EXAMPLE
 .\00-Orchestrator.ps1 -VMName "SRVWEB01" -Mode SINGLE -Phase FULL -AutoRollback
 
@@ -87,7 +91,8 @@ param(
     [switch]$ContinueOnError,
     [int]$MaxExecRetries = 1,
     [int]$RetryWaitSeconds = 60,
-    [switch]$SkipPrereqChecks
+    [switch]$SkipPrereqChecks,
+    [switch]$RunPreflight
 )
 
 Set-StrictMode -Version 2.0
@@ -489,6 +494,23 @@ try {
         if (-not $env:VCENTER_HOST -or -not $env:HYPERV_HOST) {
             Write-MigLog -Level FATAL -Message 'Critical environment variables are missing (VCENTER_HOST and/or HYPERV_HOST).'
             exit 1
+        }
+    }
+
+    if ($RunPreflight) {
+        $preflightScript = Join-Path -Path $PSScriptRoot -ChildPath '00-Preflight.ps1'
+        if (-not (Test-Path -Path $preflightScript)) {
+            Write-MigLog -Level WARN -Message "Preflight requested but script not found: $preflightScript"
+        }
+        else {
+            Write-MigLog -Level INFO -Message 'Running pre-flight readiness check...'
+            & $preflightScript -ConfigFile $ConfigFile
+            $preflightRc = $LASTEXITCODE
+            if ($preflightRc -eq 2) {
+                Write-MigLog -Level FATAL -Message 'Pre-flight reported a blocking issue. Aborting pipeline. Fix the items above and retry.'
+                exit 1
+            }
+            Write-MigLog -Level INFO -Message "Pre-flight completed (exit code $preflightRc). Continuing."
         }
     }
 
