@@ -59,6 +59,20 @@ Skip module and environment prechecks.
 Run the pre-flight readiness check (src\00-Preflight.ps1) before the pipeline.
 Aborts the run if pre-flight reports a blocking issue (exit code 2).
 
+.PARAMETER Client
+Load configuration from a client profile: config/clients/<Client>/profile.json merged
+over config/defaults.json. Enables multi-client / multi-infrastructure operation.
+
+.PARAMETER ConfigRoot
+Root of the multi-client config tree (defaults to the repo 'config' folder).
+
+.PARAMETER HooksRoot
+Directory containing <hook>.d folders (pre-pipeline, pre-EXEC, post-POST, on-failure, ...).
+Overrides config.hooks_root.
+
+.PARAMETER SkipHooks
+Disable the hook framework for this run.
+
 .EXAMPLE
 .\00-Orchestrator.ps1 -VMName "SRVWEB01" -Mode SINGLE -Phase FULL -AutoRollback
 
@@ -92,11 +106,24 @@ param(
     [int]$MaxExecRetries = 1,
     [int]$RetryWaitSeconds = 60,
     [switch]$SkipPrereqChecks,
-    [switch]$RunPreflight
+    [switch]$RunPreflight,
+
+    # Multi-client profile mode: load config/clients/<Client>/profile.json over config/defaults.json.
+    [string]$Client,
+    [string]$ConfigRoot,
+
+    # Hook framework: directory holding <hook>.d folders. Overrides config.hooks_root.
+    [string]$HooksRoot,
+    [switch]$SkipHooks
 )
 
 Set-StrictMode -Version 2.0
 $script:PhaseName = 'ORCHESTRATOR'
+
+Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'MigrationCommon.psm1') -Force
+
+$script:HooksRoot = ''
+$script:ClientName = ''
 
 function Write-MigLog {
     param(
@@ -231,6 +258,27 @@ function Invoke-SafeSleep {
     }
 }
 
+function Invoke-VmPhaseHook {
+    <#
+    .SYNOPSIS
+    Runs a hook point for the current pipeline/VM if a hooks root is configured.
+    Returns $true when a blocking (pre-*) hook aborted the phase.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Point,
+        [string]$CurrentVM = '',
+        [string]$ManifestPath = ''
+    )
+
+    if ($SkipHooks -or [string]::IsNullOrWhiteSpace($script:HooksRoot)) {
+        return $false
+    }
+
+    $ctx = New-MigHookContext -HookName $Point -Client $script:ClientName -Phase $Phase -VMName $CurrentVM -ManifestPath $ManifestPath
+    $result = Invoke-MigrationHook -HookName $Point -HooksRoot $script:HooksRoot -Context $ctx -DryRun:$DryRun
+    return [bool]$result.Blocked
+}
+
 function Invoke-VmPipeline {
     param(
         [Parameter(Mandatory)][string]$CurrentVM,
@@ -263,6 +311,14 @@ function Invoke-VmPipeline {
     }
 
     if ($Phase -in @('PRE', 'FULL')) {
+        if (Invoke-VmPhaseHook -Point 'pre-PRE' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal) {
+            $vmSummary.notes += 'Blocked by pre-PRE hook.'
+            $vmSummary.overall_result = 'FAILED'
+            $vmSummary.final_exit_code = 1
+            $vmSummary.completed_at = (Get-Date).ToString('o')
+            return $vmSummary
+        }
+
         $preParams = @{
             VMName = $CurrentVM
             vCenterServer = [string]$ConfigObj.vcenter_host
@@ -283,6 +339,8 @@ function Invoke-VmPipeline {
             return $vmSummary
         }
 
+        [void](Invoke-VmPhaseHook -Point 'post-PRE' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal)
+
         if ($Phase -eq 'PRE') {
             $vmSummary.overall_result = 'SUCCESS'
             $vmSummary.final_exit_code = 0
@@ -292,6 +350,14 @@ function Invoke-VmPipeline {
     }
 
     if ($Phase -in @('EXEC', 'FULL')) {
+        if (Invoke-VmPhaseHook -Point 'pre-EXEC' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal) {
+            $vmSummary.notes += 'Blocked by pre-EXEC hook.'
+            $vmSummary.overall_result = 'FAILED'
+            $vmSummary.final_exit_code = 1
+            $vmSummary.completed_at = (Get-Date).ToString('o')
+            return $vmSummary
+        }
+
         $maxRetry = if ($MaxExecRetries -lt 1) { 1 } else { $MaxExecRetries }
         $attempt = 0
         $execExit = 1
@@ -352,6 +418,8 @@ function Invoke-VmPipeline {
             return $vmSummary
         }
 
+        [void](Invoke-VmPhaseHook -Point 'post-EXEC' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal)
+
         if ($Phase -eq 'EXEC') {
             $vmSummary.overall_result = 'SUCCESS'
             $vmSummary.final_exit_code = 0
@@ -361,6 +429,14 @@ function Invoke-VmPipeline {
     }
 
     if ($Phase -in @('POST', 'FULL')) {
+        if (Invoke-VmPhaseHook -Point 'pre-POST' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal) {
+            $vmSummary.notes += 'Blocked by pre-POST hook.'
+            $vmSummary.overall_result = 'FAILED'
+            $vmSummary.final_exit_code = 1
+            $vmSummary.completed_at = (Get-Date).ToString('o')
+            return $vmSummary
+        }
+
         $postParams = @{
             VMName = $CurrentVM
             ManifestPath = $manifestPathLocal
@@ -375,6 +451,7 @@ function Invoke-VmPipeline {
         $vmSummary.phases.post.status = if ($postResult.ExitCode -eq 0) { 'SUCCESS' } else { 'FAILED' }
 
         if ($postResult.ExitCode -eq 0) {
+            [void](Invoke-VmPhaseHook -Point 'post-POST' -CurrentVM $CurrentVM -ManifestPath $manifestPathLocal)
             $vmSummary.overall_result = 'SUCCESS'
             $vmSummary.final_exit_code = 0
             $vmSummary.completed_at = (Get-Date).ToString('o')
@@ -464,12 +541,21 @@ $summary = [ordered]@{
 }
 
 try {
-    if (-not (Test-Path -Path $ConfigFile)) {
-        Write-MigLog -Level FATAL -Message "Config file not found: $ConfigFile"
-        exit 1
+    if (-not [string]::IsNullOrWhiteSpace($Client)) {
+        Write-MigLog -Level INFO -Message "Loading client profile: $Client"
+        $config = Get-MigrationConfig -Client $Client -ConfigRoot $ConfigRoot
+        $script:ClientName = $Client
+        $summary.client = $Client
+    }
+    else {
+        if (-not (Test-Path -Path $ConfigFile)) {
+            Write-MigLog -Level FATAL -Message "Config file not found: $ConfigFile"
+            exit 1
+        }
+        $config = Get-MigrationConfig -ConfigFile $ConfigFile
+        $script:ClientName = ''
     }
 
-    $config = Get-Content -Path $ConfigFile -Raw | ConvertFrom-Json
     $logDir = [string]$config.log_dir
     if ([string]::IsNullOrWhiteSpace($logDir)) { $logDir = 'C:\Migration\Logs' }
     if (-not (Test-Path -Path $logDir)) {
@@ -501,6 +587,9 @@ try {
         $preflightScript = Join-Path -Path $PSScriptRoot -ChildPath '00-Preflight.ps1'
         if (-not (Test-Path -Path $preflightScript)) {
             Write-MigLog -Level WARN -Message "Preflight requested but script not found: $preflightScript"
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($Client)) {
+            Write-MigLog -Level WARN -Message 'RunPreflight is file-based and is skipped in client-profile mode. Run src\00-Preflight.ps1 against a generated config if needed.'
         }
         else {
             Write-MigLog -Level INFO -Message 'Running pre-flight readiness check...'
@@ -534,6 +623,29 @@ try {
         }
     }
 
+    # Resolve hooks root: explicit param wins, otherwise config.hooks_root (relative to repo root).
+    if (-not $SkipHooks) {
+        $repoRoot = Split-Path -Path $PSScriptRoot -Parent
+        if (-not [string]::IsNullOrWhiteSpace($HooksRoot)) {
+            $script:HooksRoot = $HooksRoot
+        }
+        elseif (($config -is [System.Collections.IDictionary]) -and $config.Contains('hooks_root') -and -not [string]::IsNullOrWhiteSpace([string]$config.hooks_root)) {
+            $hr = [string]$config.hooks_root
+            if (-not [System.IO.Path]::IsPathRooted($hr)) {
+                $hr = Join-Path -Path $repoRoot -ChildPath $hr
+            }
+            $script:HooksRoot = $hr
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($script:HooksRoot) -and -not (Test-Path -Path $script:HooksRoot)) {
+            Write-MigLog -Level WARN -Message "Hooks root not found, hooks disabled: $script:HooksRoot"
+            $script:HooksRoot = ''
+        }
+        if (-not [string]::IsNullOrWhiteSpace($script:HooksRoot)) {
+            Write-MigLog -Level INFO -Message "Hooks enabled. Root: $script:HooksRoot"
+        }
+    }
+
     $targetVms = Resolve-TargetVMs -ResolvedMode $Mode -SingleVmName $VMName -CsvPath $VMListPath -ArrayVmNames $VMNames -ManifestDirectory ([string]$config.output_dir)
     $summary.vm_total = $targetVms.Count
 
@@ -541,6 +653,16 @@ try {
 
     if ($DryRun) {
         Write-MigLog -Level INFO -Message "Dry-run VM list: $($targetVms -join ', ')"
+    }
+
+    # pre-pipeline hook (blocking).
+    if (-not $SkipHooks -and -not [string]::IsNullOrWhiteSpace($script:HooksRoot)) {
+        $ppContext = New-MigHookContext -HookName 'pre-pipeline' -Client $script:ClientName -Phase $Phase
+        $ppResult = Invoke-MigrationHook -HookName 'pre-pipeline' -HooksRoot $script:HooksRoot -Context $ppContext -DryRun:$DryRun
+        if ($ppResult.Blocked) {
+            Write-MigLog -Level FATAL -Message 'pre-pipeline hook blocked the run. Aborting.'
+            exit 1
+        }
     }
 
     $vmResults = New-Object System.Collections.Generic.List[object]
@@ -558,6 +680,13 @@ try {
             default { $summary.vm_failed++ }
         }
 
+        if ([string]$oneResult.overall_result -in @('FAILED', 'ROLLED_BACK')) {
+            if (-not $SkipHooks -and -not [string]::IsNullOrWhiteSpace($script:HooksRoot)) {
+                $ofContext = New-MigHookContext -HookName 'on-failure' -Client $script:ClientName -Phase $Phase -VMName $current -ManifestPath ([string]$oneResult.manifest_path) -Extra @{ result = [string]$oneResult.overall_result; final_exit_code = [int]$oneResult.final_exit_code }
+                [void](Invoke-MigrationHook -HookName 'on-failure' -HooksRoot $script:HooksRoot -Context $ofContext -DryRun:$DryRun)
+            }
+        }
+
         if (([string]$oneResult.overall_result -in @('FAILED', 'ROLLED_BACK')) -and (-not $ContinueOnError) -and ($targetVms.Count -gt 1)) {
             Write-MigLog -Level WARN -Message "Stopping batch after failure on VM '$current' because ContinueOnError is disabled."
             break
@@ -565,6 +694,12 @@ try {
     }
 
     $summary.vms = @($vmResults)
+
+    # post-pipeline hook (non-blocking).
+    if (-not $SkipHooks -and -not [string]::IsNullOrWhiteSpace($script:HooksRoot)) {
+        $endContext = New-MigHookContext -HookName 'post-pipeline' -Client $script:ClientName -Phase $Phase -Extra @{ vm_total = $summary.vm_total; vm_done = $summary.vm_done; vm_failed = $summary.vm_failed }
+        [void](Invoke-MigrationHook -HookName 'post-pipeline' -HooksRoot $script:HooksRoot -Context $endContext -DryRun:$DryRun)
+    }
 
     if ($summary.vm_failed -gt 0) {
         if ($summary.vm_rolled_back -gt 0 -and $summary.vm_done -eq 0 -and $summary.vm_partial -eq 0) {

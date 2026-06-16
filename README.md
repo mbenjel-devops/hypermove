@@ -6,8 +6,11 @@ Pipeline PowerShell de migration VMware vers Hyper-V, structuré en 4 phases + o
 
 - Start-Migration.ps1 (interactive launcher / menu for technicians)
 - config.example.json (copy to your config path and edit)
+- config/defaults.json + config/clients/<client>/profile.json (multi-client profiles)
+- config/clients/<client>/hooks/ (pre/post hook scripts)
 - src/00-Orchestrator.ps1
 - src/00-Preflight.ps1 (readiness / doctor check)
+- src/MigrationCommon.psm1 (profiles, hooks, secrets)
 - src/01-PRE-Discovery.ps1
 - src/02-EXEC-Migration.ps1
 - src/03-POST-Validation.ps1
@@ -15,6 +18,8 @@ Pipeline PowerShell de migration VMware vers Hyper-V, structuré en 4 phases + o
 - tests/PRE.Tests.ps1
 - tests/EXEC.Tests.ps1
 - tests/POST.Tests.ps1
+- tests/MigrationCommon.Tests.ps1
+- .github/workflows/ci.yml (syntax + Pester CI)
 
 ## Prerequisites
 
@@ -95,11 +100,72 @@ Common field problems and how the toolkit handles them:
   conversion tool): run `src\00-Preflight.ps1` (the doctor) to get a clear PASS/WARN/FAIL
   report with remediation hints before migrating.
 
-## Tests
+## Enterprise: multi-client, hooks, secrets
+
+### Multi-client profiles
+
+Run the same toolkit against many clients/infrastructures without editing the core.
+Configuration lives under `config/`:
+
+```
+config/
+  defaults.json                     # shared defaults
+  clients/
+    <client>/profile.json           # per-client overrides (merged over defaults)
+    <client>/hooks/                 # per-client hook scripts
+```
 
 ```powershell
-Invoke-Pester -Path .\tests\PRE.Tests.ps1 -Output Detailed
+# Use a client profile instead of a single config file
+.\src\00-Orchestrator.ps1 -Client "example-client" -Mode SINGLE -VMName "SRV01" -Phase FULL
 ```
+
+The effective config is `defaults.json` deep-merged with the client `profile.json`
+(profile wins). Manifests/reports/logs paths can be isolated per client.
+
+### Pre/post hook framework
+
+Plug custom scripts and integrate with external systems at defined points, without
+touching the pipeline. Hooks are `*.ps1` files inside `<hook>.d` folders, run in
+alphabetical order:
+
+| Hook point | When | Blocking |
+|------------|------|----------|
+| `pre-pipeline` | once before any VM | yes |
+| `pre-PRE` / `post-PRE` | around discovery | pre only |
+| `pre-EXEC` / `post-EXEC` | around conversion | pre only |
+| `pre-POST` / `post-POST` | around validation | pre only |
+| `on-failure` | a VM failed/rolled back | no |
+| `post-pipeline` | once after all VMs | no |
+
+Each hook receives a JSON context (VM, client, phase, manifest path) via a
+`-ContextPath` parameter and the `MIG_HOOK_CONTEXT_PATH` environment variable. A
+non-zero exit from a `pre-*` hook aborts that phase; `post-*` / `on-failure` failures
+are logged but non-blocking. See `config/clients/example-client/hooks/` for samples
+(backup gate, notification). Disable with `-SkipHooks`.
+
+### Secrets
+
+Values shaped `secret://<Vault>/<Name>` in a profile are resolved at load time via
+`Microsoft.PowerShell.SecretManagement`. Store credentials in a registered vault and
+reference them instead of hard-coding. Example: `"vcenter_pass": "secret://MigrationVault/clientA-vcenter"`.
+
+## Tests
+
+Local run (requires Pester 5.5+):
+
+```powershell
+.\tests\Invoke-Tests.ps1
+```
+
+Or directly:
+
+```powershell
+Invoke-Pester -Path .\tests -Output Detailed
+```
+
+CI runs syntax validation + the full Pester suite on every push/PR
+(see `.github/workflows/ci.yml`).
 
 ## Exit codes summary
 

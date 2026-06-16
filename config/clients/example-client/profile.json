@@ -1,0 +1,20 @@
+{
+  "vcenter_host": "vcenter-clienta.domain.local",
+  "vcenter_user": "migration-svc@vsphere.local",
+  "vcenter_pass": "secret://MigrationVault/clientA-vcenter",
+  "hyperv_host": "hyperv-clienta01.domain.local",
+  "hyperv_vm_path": "E:\\Hyper-V\\VMs",
+  "hyperv_vhdx_path": "E:\\Hyper-V\\VHDs",
+  "hyperv_switch": "ClientA-External",
+  "output_dir": "C:\\Migration\\clientA\\Manifests",
+  "report_dir": "C:\\Migration\\clientA\\Reports",
+  "log_dir": "C:\\Migration\\clientA\\Logs",
+  "conversion_tool": "StarWindV2V",
+  "critical_services": [
+    "W32Time",
+    "Netlogon",
+    "LanmanServer",
+    "MSSQLSERVER"
+  ],
+  "hooks_root": "config\\clients\\example-client\\hooks"
+}

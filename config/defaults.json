@@ -1,0 +1,14 @@
+{
+  "hyperv_vm_path": "D:\\Hyper-V\\VMs",
+  "hyperv_vhdx_path": "D:\\Hyper-V\\VHDs",
+  "hyperv_switch": "External",
+  "output_dir": "C:\\Migration\\Manifests",
+  "report_dir": "C:\\Migration\\Reports",
+  "log_dir": "C:\\Migration\\Logs",
+  "conversion_tool": "StarWindV2V",
+  "critical_services": [
+    "W32Time",
+    "Netlogon",
+    "LanmanServer"
+  ]
+}

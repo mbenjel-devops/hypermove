@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Syntax + Pester (PowerShell 7)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: PowerShell version
+        shell: pwsh
+        run: $PSVersionTable | Format-List
+
+      - name: Syntax validation (all scripts)
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Path 'src','tests','.' -Include '*.ps1','*.psm1' -Recurse -File |
+            Where-Object { $_.FullName -notmatch '\\migration-tool\\' }
+          $hadError = $false
+          foreach ($f in $files) {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors -and $errors.Count -gt 0) {
+              $hadError = $true
+              Write-Host "FAIL: $($f.FullName)"
+              $errors | ForEach-Object { Write-Host "  $($_.Message) (line $($_.Extent.StartLineNumber))" }
+            }
+            else {
+              Write-Host "OK:   $($f.Name)"
+            }
+          }
+          if ($hadError) { throw 'Syntax errors found.' }
+
+      - name: Install Pester 5
+        shell: pwsh
+        run: |
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+
+      - name: Run Pester tests
+        shell: pwsh
+        run: |
+          Import-Module Pester -MinimumVersion 5.5.0 -Force
+          $config = New-PesterConfiguration
+          $config.Run.Path = 'tests'
+          $config.Output.Verbosity = 'Detailed'
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'testResults.xml'
+          $config.Run.Exit = $true
+          Invoke-Pester -Configuration $config
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-results
+          path: testResults.xml

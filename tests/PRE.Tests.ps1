@@ -12,6 +12,18 @@ Describe '01-PRE-Discovery.ps1' {
         if (-not (Test-Path -Path $scriptUnderTest)) {
             throw "Script under test not found: $scriptUnderTest"
         }
+
+        # Define stub functions for PowerCLI cmdlets when the module is not installed
+        # (e.g. in CI), so Pester can mock them. Real PowerCLI takes precedence if present.
+        $powerCliCommands = @(
+            'Get-VIServer', 'Connect-VIServer', 'Disconnect-VIServer', 'Get-VM',
+            'Get-HardDisk', 'Get-NetworkAdapter', 'Get-Snapshot', 'Get-VMGuest', 'Invoke-VMScript'
+        )
+        foreach ($cmdName in $powerCliCommands) {
+            if (-not (Get-Command -Name $cmdName -ErrorAction SilentlyContinue)) {
+                Set-Item -Path ("function:script:{0}" -f $cmdName) -Value { param() }
+            }
+        }
     }
 
     BeforeEach {
