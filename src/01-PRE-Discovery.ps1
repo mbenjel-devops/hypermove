@@ -96,10 +96,24 @@ function Convert-HardwareVersionToInt {
     return 0
 }
 
+function Get-MigLeafTypeName {
+    # Returns the leaf (short) type name of an object's most-derived type.
+    # For real .NET objects (e.g. PowerCLI VMware.Vim types) PSObject.TypeNames[0]
+    # is the full type name, so the leaf equals GetType().Name. For test doubles
+    # created with -PSTypeName it returns the synthetic type, enabling unit testing.
+    param($Object)
+    if ($null -eq $Object) { return '' }
+    $names = @($Object.PSObject.TypeNames)
+    if ($names.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($names[0])) {
+        return ($names[0] -split '\.')[-1]
+    }
+    return $Object.GetType().Name
+}
+
 function Get-ProvisioningType {
     param($HardDisk)
     try {
-        $typeName = $HardDisk.ExtensionData.Backing.GetType().Name
+        $typeName = Get-MigLeafTypeName -Object $HardDisk.ExtensionData.Backing
         if ($typeName -match 'FlatVer2BackingInfo') {
             if ($HardDisk.ExtensionData.Backing.EagerlyScrub -eq $true) {
                 return 'Thick Eager'
@@ -122,7 +136,7 @@ function Get-BusType {
         $ctrlKey = $HardDisk.ExtensionData.ControllerKey
         $controllers = $HardDisk.Parent.ExtensionData.Config.Hardware.Device | Where-Object { $_.Key -eq $ctrlKey }
         if (-not $controllers) { return 'Unknown' }
-        $ctrlType = $controllers[0].GetType().Name
+        $ctrlType = Get-MigLeafTypeName -Object $controllers[0]
         if ($ctrlType -match 'ParaVirtualSCSI|VirtualLsiLogicSAS|VirtualLsiLogicController|VirtualBusLogicController') { return 'SCSI' }
         if ($ctrlType -match 'VirtualSATAController') { return 'SATA' }
         if ($ctrlType -match 'VirtualIDEController') { return 'IDE' }
@@ -305,7 +319,7 @@ try {
     catch {
         Write-MigLog -Level ERROR -Message "$($_.Exception.Message)"
         Write-MigLog -Level ERROR -Message "$($_.ScriptStackTrace)"
-        Write-Error "[$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')][ERROR][PHASE-PRE] vCenter connection failed."
+        Write-Error "[$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')][ERROR][PHASE-PRE] vCenter connection failed." -ErrorAction Continue
         exit 3
     }
 
@@ -348,7 +362,7 @@ try {
         $hardDisks = @(Get-HardDisk -VM $vm -ErrorAction Stop)
         foreach ($hd in $hardDisks) {
             $isRdm = $false
-            $backingType = $hd.ExtensionData.Backing.GetType().Name
+            $backingType = Get-MigLeafTypeName -Object $hd.ExtensionData.Backing
             if ($backingType -match 'RawVirtualDisk|RawPhysicalDisk') {
                 $isRdm = $true
             }
@@ -501,7 +515,7 @@ cat /etc/resolv.conf
     if ($snapshots.Count -ge 1) {
         $snapshotNames = ($snapshots | Select-Object -ExpandProperty Name) -join ', '
         Add-Check -Id 'CHECK_01' -Status 'FAIL' -Detail "Snapshots detected: $snapshotNames"
-        Write-Error "[FATAL][CHECK_01] Snapshots detectes : $snapshotNames. Migration interdite."
+        Write-Error "[FATAL][CHECK_01] Snapshots detectes : $snapshotNames. Migration interdite." -ErrorAction Continue
         $blockingFailure = $true
     }
     else {
@@ -513,7 +527,7 @@ cat /etc/resolv.conf
     if ($rdmOrShared) {
         $labels = ($rdmOrShared | Select-Object -ExpandProperty label) -join ', '
         Add-Check -Id 'CHECK_02' -Status 'FAIL' -Detail "RDM/shared disk detected: $labels"
-        Write-Error "[FATAL][CHECK_02] Disque RDM ou partage : $labels. Migration interdite."
+        Write-Error "[FATAL][CHECK_02] Disque RDM ou partage : $labels. Migration interdite." -ErrorAction Continue
         $blockingFailure = $true
     }
     else {
@@ -524,7 +538,7 @@ cat /etc/resolv.conf
     $validGuestIp = @($guestNetwork | Where-Object { Test-ValidIPv4 -Ip $_.ip })
     if ($validGuestIp.Count -eq 0) {
         Add-Check -Id 'CHECK_03' -Status 'FAIL' -Detail 'No valid in-guest IP could be retrieved.'
-        Write-Error '[FATAL][CHECK_03] Aucune IP valide recuperee dans le guest. Migration interdite.'
+        Write-Error '[FATAL][CHECK_03] Aucune IP valide recuperee dans le guest. Migration interdite.' -ErrorAction Continue
         $blockingFailure = $true
     }
     else {
@@ -582,7 +596,7 @@ cat /etc/resolv.conf
         }
         else {
             Add-Check -Id 'CHECK_08' -Status 'FAIL' -Detail "Legacy guest OS not approved: $guestFullName"
-            Write-Error "[FATAL][CHECK_08] Legacy OS detecte : $guestFullName. Utilisez -ApproveLegacyOS pour autoriser explicitement."
+            Write-Error "[FATAL][CHECK_08] Legacy OS detecte : $guestFullName. Utilisez -ApproveLegacyOS pour autoriser explicitement." -ErrorAction Continue
             $blockingFailure = $true
         }
     }
@@ -620,7 +634,7 @@ cat /etc/resolv.conf
         disks = @($disks)
         network_adapters = @($nics)
         guest_network = @($guestNetwork)
-        checks = @($script:checks)
+        checks = $script:checks.ToArray()
         overall_status = $overallStatus
         exit_code = 0
     }

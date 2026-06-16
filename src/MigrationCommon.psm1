@@ -25,7 +25,8 @@ function Write-MigCommonLog {
         [Parameter(Mandatory)][string]$Message,
         [string]$Phase = 'COMMON'
     )
-    Write-Output "[$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')][$Level][$Phase] $Message"
+    # Use the Information stream (not Output) so logging never pollutes function return values.
+    Write-Information -MessageData "[$(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss')][$Level][$Phase] $Message" -InformationAction Continue
 }
 
 function ConvertTo-MigHashtableDeep {

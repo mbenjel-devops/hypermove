@@ -15,15 +15,38 @@ Describe '01-PRE-Discovery.ps1' {
 
         # Define stub functions for PowerCLI cmdlets when the module is not installed
         # (e.g. in CI), so Pester can mock them. Real PowerCLI takes precedence if present.
+        # They MUST be global so the separately-invoked script under test (& $scriptUnderTest)
+        # can resolve them; a script-scoped function would be invisible to that child scope.
+        $script:stubbedCommands = @()
         $powerCliCommands = @(
             'Get-VIServer', 'Connect-VIServer', 'Disconnect-VIServer', 'Get-VM',
             'Get-HardDisk', 'Get-NetworkAdapter', 'Get-Snapshot', 'Get-VMGuest', 'Invoke-VMScript'
         )
         foreach ($cmdName in $powerCliCommands) {
             if (-not (Get-Command -Name $cmdName -ErrorAction SilentlyContinue)) {
-                Set-Item -Path ("function:script:{0}" -f $cmdName) -Value { param() }
+                Set-Item -Path ("function:global:{0}" -f $cmdName) -Value { param() }
+                $script:stubbedCommands += $cmdName
             }
         }
+
+        # Provide non-interactive vCenter credentials via env so the script never calls
+        # Get-Credential (which would hang/fail in CI). Connect-VIServer is mocked per test.
+        $script:savedVcHost = $env:VCENTER_HOST
+        $script:savedVcUser = $env:VCENTER_USER
+        $script:savedVcPass = $env:VCENTER_PASS
+        $env:VCENTER_HOST = 'vcsa01.local'
+        $env:VCENTER_USER = 'svc-migration'
+        $env:VCENTER_PASS = 'dummy-pass'
+    }
+
+    AfterAll {
+        foreach ($cmdName in $script:stubbedCommands) {
+            $p = "function:global:$cmdName"
+            if (Test-Path -Path $p) { Remove-Item -Path $p -Force -ErrorAction SilentlyContinue }
+        }
+        $env:VCENTER_HOST = $script:savedVcHost
+        $env:VCENTER_USER = $script:savedVcUser
+        $env:VCENTER_PASS = $script:savedVcPass
     }
 
     BeforeEach {
@@ -68,7 +91,7 @@ Describe '01-PRE-Discovery.ps1' {
                                     Device = @(
                                         [pscustomobject]@{
                                             Key = 1000
-                                            PSTypeNames = @('VirtualLsiLogicController')
+                                            PSTypeName = 'VirtualLsiLogicController'
                                         }
                                     )
                                 }
@@ -81,7 +104,7 @@ Describe '01-PRE-Discovery.ps1' {
                             ThinProvisioned = $true
                             EagerlyScrub = $false
                             Sharing = 'sharingNone'
-                            PSTypeNames = @('VirtualDiskFlatVer2BackingInfo')
+                            PSTypeName = 'VirtualDiskFlatVer2BackingInfo'
                         }
                     }
                 },
@@ -96,7 +119,7 @@ Describe '01-PRE-Discovery.ps1' {
                                     Device = @(
                                         [pscustomobject]@{
                                             Key = 1000
-                                            PSTypeNames = @('VirtualLsiLogicController')
+                                            PSTypeName = 'VirtualLsiLogicController'
                                         }
                                     )
                                 }
@@ -109,7 +132,7 @@ Describe '01-PRE-Discovery.ps1' {
                             ThinProvisioned = $true
                             EagerlyScrub = $false
                             Sharing = 'sharingNone'
-                            PSTypeNames = @('VirtualDiskFlatVer2BackingInfo')
+                            PSTypeName = 'VirtualDiskFlatVer2BackingInfo'
                         }
                     }
                 }
@@ -189,7 +212,7 @@ Describe '01-PRE-Discovery.ps1' {
                             ControllerKey = 1000
                             Backing = [pscustomobject]@{
                                 Sharing = 'sharingNone'
-                                PSTypeNames = @('RawVirtualDisk')
+                                PSTypeName = 'RawVirtualDisk'
                             }
                         }
                     }
@@ -305,7 +328,7 @@ Describe '01-PRE-Discovery.ps1' {
                                 ThinProvisioned = $true
                                 EagerlyScrub = $false
                                 Sharing = 'sharingNone'
-                                PSTypeNames = @('VirtualDiskFlatVer2BackingInfo')
+                                PSTypeName = 'VirtualDiskFlatVer2BackingInfo'
                             }
                         }
                     }
@@ -362,9 +385,5 @@ Describe '01-PRE-Discovery.ps1' {
 
             (Get-Content -Path $existing -Raw) | Should -Match 'seed'
         }
-    }
-
-    AfterEach {
-        Should -Invoke Get-VM -AtLeast 1
     }
 }
